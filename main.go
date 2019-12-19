@@ -15,10 +15,10 @@ import (
 	stomp "github.com/go-stomp/stomp"
 )
 
-type Phone struct {
-	Number  string `json:"number"`
-	Simple  string `json:"simple"`
-	Indepth string `json:"indepth"`
+type Log struct {
+	TimeStamp string `json:"timestamp"`
+	Command   string `json:"command"`
+	Number    string `json:"number"`
 }
 
 func newSQL() (*sql.DB, error) {
@@ -49,6 +49,15 @@ func newREDIS() (*redis.Client, error) {
 	if err != nil {
 		log.Println("Redis Fail Ping")
 		return nil, err
+	}
+	result, err := client.Exists("LOG").Result()
+	if err != nil {
+		return nil, err
+	} else if result == 0 {
+		err = client.Set("LOG", "", 0).Err()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return client, nil
 }
@@ -82,13 +91,16 @@ func main() {
 	}
 	defer conn.Disconnect()
 	wg.Add(1)
+	wg.Add(1)
 	go receiveRequest(conn, db, client, wg)
+	go receiveLogRequest(conn, client, wg)
 	wg.Wait()
 	log.Println("FINISH")
 }
 
-func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.WaitGroup) {
-	sub, err := conn.Subscribe("/topic/request", stomp.AckAuto)
+func receiveLogRequest(conn *stomp.Conn, client *redis.Client, wg sync.WaitGroup) {
+	defer wg.Done()
+	sub, err := conn.Subscribe("/topic/logreq", stomp.AckAuto)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -99,13 +111,49 @@ func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.
 			continue
 		}
 		log.Println(smsg)
+		result, err := client.Get("LOG").Result()
+		if err != nil {
+			log.Println(err)
+		}
+		result = "[" + result[1:] + "]"
+		err = conn.Send(
+			"/topic/logres/", // destination
+			"text/plain",     // content-type
+			[]byte(result))   // body
+		if err != nil {
+			log.Println(err)
+		}
+
+	}
+
+	err = sub.Unsubscribe()
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.WaitGroup) {
+	defer wg.Done()
+	sub, err := conn.Subscribe("/topic/request", stomp.AckAuto)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	for {
+		msg := <-sub.C
+		var smsg string = string(msg.Body)
+		if smsg == "" && len(smsg) < 13 {
+			continue
+		}
+		log.Println(smsg)
+		logToRedis(client, smsg)
 
 		val, err := client.Get(smsg).Result()
 		if err != nil {
 			switch smsg[0:3] {
 			case "csr":
 				responsevalue := checkSimple(smsg[3:], db)
-				conn.Send(
+				err = conn.Send(
 					"/topic/response/"+smsg, // destination
 					"text/plain",            // content-type
 					[]byte(responsevalue))   // body
@@ -117,7 +165,7 @@ func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.
 					fmt.Println(err)
 				}
 			default:
-				conn.Send(
+				err = conn.Send(
 					"/topic/response/"+smsg,   // destination
 					"text/plain",              // content-type
 					[]byte("Invalid command")) // body
@@ -126,7 +174,7 @@ func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.
 				}
 			}
 		} else {
-			conn.Send(
+			err = conn.Send(
 				"/topic/response/"+smsg, // destination
 				"text/plain",            // content-type
 				[]byte(val))             // body
@@ -142,6 +190,18 @@ func receiveRequest(conn *stomp.Conn, db *sql.DB, client *redis.Client, wg sync.
 		panic(err.Error())
 	}
 
+}
+
+func logToRedis(client *redis.Client, msg string) {
+
+	objectjson, err := json.Marshal(Log{TimeStamp: time.Now().UTC().String(), Command: msg[:3], Number: msg[3:]})
+	if err != nil {
+		panic(err)
+	}
+	err = client.Append("LOG", ","+string(objectjson)).Err()
+	if err != nil {
+		panic(err)
+	}
 }
 
 func checkSimple(number string, db *sql.DB) string {
